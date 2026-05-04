@@ -52,20 +52,24 @@ function getCoinsFromPayment(body) {
   let total = 0;
 
   for (const [name, amount] of Object.entries(COIN_PACKAGES)) {
-    if (text.includes(name)) {
-      total += amount;
-    }
+    if (text.includes(name)) total += amount;
   }
 
   return total;
 }
 
-async function addCoinsToBank(steamId, coins) {
+function getPaymentId(body) {
+  return (
+    body?.subject?.transaction_id ||
+    body?.subject?.id ||
+    body?.id ||
+    crypto.createHash("sha256").update(JSON.stringify(body)).digest("hex")
+  );
+}
+
+async function connectFtp() {
   const client = new ftp.Client();
   client.ftp.verbose = true;
-
-  const remoteFile = `${process.env.BANK_DIR}/${steamId}.json`;
-  const tempFile = path.join(os.tmpdir(), `${steamId}.json`);
 
   await client.access({
     host: process.env.ZAP_HOST,
@@ -75,25 +79,62 @@ async function addCoinsToBank(steamId, coins) {
     secure: false
   });
 
+  return client;
+}
+
+async function downloadJsonOrDefault(client, remoteFile, defaultData) {
+  const tempFile = path.join(os.tmpdir(), path.basename(remoteFile));
+
   try {
     await client.downloadTo(tempFile, remoteFile);
+    const raw = await fs.readFile(tempFile, "utf8");
+    return { data: JSON.parse(raw || "{}"), tempFile };
   } catch {
-    await fs.writeFile(tempFile, JSON.stringify({ [process.env.BANK_KEY || "bank"]: 0 }, null, 2));
+    await fs.writeFile(tempFile, JSON.stringify(defaultData, null, 2));
+    return { data: defaultData, tempFile };
   }
+}
 
-  const raw = await fs.readFile(tempFile, "utf8");
-  const data = JSON.parse(raw || "{}");
+async function addCoinsToBank(steamId, coins, paymentId) {
+  const client = await connectFtp();
 
-  const bankKey = process.env.BANK_KEY || "bank";
-  const current = Number(data[bankKey] || 0);
-  data[bankKey] = current + coins;
+  try {
+    const bankDir = process.env.BANK_DIR;
+    const bankKey = process.env.BANK_KEY || "bank";
 
-  await fs.writeFile(tempFile, JSON.stringify(data, null, 2));
-  await client.uploadFrom(tempFile, remoteFile);
+    const processedFile = `${bankDir}/ProcessedPayments.json`;
+    const bankFile = `${bankDir}/${steamId}.json`;
 
-  client.close();
+    const processedResult = await downloadJsonOrDefault(client, processedFile, { processed: [] });
+    const processed = processedResult.data.processed || [];
 
-  console.log(`✅ Added ${coins} coins to ${steamId}. New balance: ${data[bankKey]}`);
+    if (processed.includes(paymentId)) {
+      console.log(`⚠️ Duplicate payment blocked: ${paymentId}`);
+      return { duplicate: true };
+    }
+
+    const bankResult = await downloadJsonOrDefault(client, bankFile, { [bankKey]: 0 });
+    const bankData = bankResult.data;
+
+    const current = Number(bankData[bankKey] || 0);
+    bankData[bankKey] = current + coins;
+
+    processed.push(paymentId);
+    processedResult.data.processed = processed;
+
+    await fs.writeFile(bankResult.tempFile, JSON.stringify(bankData, null, 2));
+    await fs.writeFile(processedResult.tempFile, JSON.stringify(processedResult.data, null, 2));
+
+    await client.uploadFrom(bankResult.tempFile, bankFile);
+    await client.uploadFrom(processedResult.tempFile, processedFile);
+
+    console.log(`✅ Added ${coins} coins to ${steamId}. New balance: ${bankData[bankKey]}`);
+    console.log(`🔒 Saved processed payment: ${paymentId}`);
+
+    return { duplicate: false };
+  } finally {
+    client.close();
+  }
 }
 
 app.post("/tebex", async (req, res) => {
@@ -113,22 +154,17 @@ app.post("/tebex", async (req, res) => {
 
     const steamId = findSteamId(body);
     const coins = getCoinsFromPayment(body);
+    const paymentId = getPaymentId(body);
 
     console.log("SteamID:", steamId);
     console.log("Coins:", coins);
+    console.log("Payment ID:", paymentId);
 
-    if (!steamId) {
-      console.log("❌ No SteamID found in Tebex payment.");
-      return res.status(400).send("No SteamID found");
-    }
-
-    if (!coins) {
-      console.log("❌ No matching coin package found.");
-      return res.status(400).send("No coin package matched");
-    }
+    if (!steamId) return res.status(400).send("No SteamID found");
+    if (!coins) return res.status(400).send("No coin package matched");
 
     try {
-      await addCoinsToBank(steamId, coins);
+      await addCoinsToBank(steamId, coins, paymentId);
     } catch (err) {
       console.error("❌ Failed to add coins:", err);
       return res.status(500).send("Failed to add coins");
